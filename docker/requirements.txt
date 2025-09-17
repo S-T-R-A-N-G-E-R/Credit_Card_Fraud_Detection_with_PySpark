@@ -1,0 +1,20 @@
+# Core ML + Spark
+pyspark>=3.3.1
+pandas>=2.0
+numpy>=1.23
+scikit-learn>=1.1
+xgboost>=1.6
+lightgbm>=3.3
+pyarrow>=10.0
+
+# API + Serving
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+prometheus-client==0.20.0
+requests
+
+# Experiment tracking (if API logs to MLflow)
+mlflow>=2.2
+
+# Utils
+tqdm

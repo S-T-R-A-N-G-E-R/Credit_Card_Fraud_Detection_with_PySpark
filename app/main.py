@@ -1,42 +1,36 @@
-from fastapi import FastAPI, UploadFile, File
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, Request
+from pydantic import create_model
 from typing import Optional
 import pandas as pd
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf
+from pyspark.sql.functions import col as spark_col, udf
 from pyspark.sql.types import DoubleType
 from pyspark.ml import PipelineModel
 from pyspark.ml.classification import GBTClassificationModel
-from pyspark.ml.functions import vector_to_array
-import os
-import traceback
-import time
-import logging
-from fastapi import Request
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
-
-import os
-import logging
+from contextlib import asynccontextmanager
+import os, time, logging, traceback
+from pydantic import BaseModel, create_model
+from typing import Optional
 
 # ==================================================
-# Define UDF for probability extraction
+# UDF for fraud probability
 # ==================================================
 def extract_prob(v):
     try:
-        return float(v[1])  # fraud = class 1
+        return float(v[1])
     except Exception:
         return None
 
 extract_prob_udf = udf(extract_prob, DoubleType())
 
+
 # ==================================================
-# Setup Logging
+# Logging setup
 # ==================================================
-# Ensure logs directory exists
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
-
 LOG_FILE = os.path.join(LOG_DIR, "api.log")
 
 logging.basicConfig(
@@ -48,12 +42,42 @@ logging.basicConfig(
 
 
 # ==================================================
-# Prometheus Metrics
+# Prometheus metrics
 # ==================================================
 REQUEST_COUNT = Counter("api_requests_total", "Total API Requests", ["endpoint"])
 REQUEST_LATENCY = Histogram("api_request_latency_seconds", "Request latency", ["endpoint"])
-FRAUD_PROBABILITY = Histogram("fraud_probability", "Distribution of fraud probability", buckets=[0,0.1,0.25,0.5,0.75,0.9,1.0])
+FRAUD_PROBABILITY = Histogram("fraud_probability", "Distribution of fraud probability",
+                              buckets=[0,0.1,0.25,0.5,0.75,0.9,1.0])
 
+
+# ==================================================
+# Globals for Spark + Models
+# ==================================================
+spark = None
+pipeline_model = None
+gbt_model = None
+
+
+# ==================================================
+# Lifespan handler
+# ==================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global spark, pipeline_model, gbt_model
+    print("🔄 Initializing Spark + Models...")
+    spark = SparkSession.builder.appName("CreditCardFraudAPI").getOrCreate()
+    pipeline_model = PipelineModel.load("models/preprocessing_pipeline")
+    gbt_model = GBTClassificationModel.load("models/gbt_fraud_model")
+
+    yield
+
+    print("🛑 Stopping Spark...")
+    spark.stop()
+
+# ==================================================
+# FastAPI app
+# ==================================================
+app = FastAPI(lifespan=lifespan)
 
 # ==================================================
 # Compatibility fix for pandas >= 2.0
@@ -68,9 +92,6 @@ if not hasattr(pd.DataFrame, "iteritems"):
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PIPELINE_PATH = os.path.join(BASE_DIR, "models", "preprocessing_pipeline")
 MODEL_PATH = os.path.join(BASE_DIR, "models", "gbt_fraud_model")
-
-from pydantic import BaseModel, create_model
-from typing import Optional
 
 # ==================================================
 # Define request schema dynamically
@@ -168,38 +189,19 @@ EXPECTED_FEATURES = [
     "DeviceType", "DeviceInfo"
 ]
 
+# ==================================================
+# Compatibility fix for pandas >= 2.0
+# ==================================================
+if not hasattr(pd.DataFrame, "iteritems"):
+    pd.DataFrame.iteritems = pd.DataFrame.items
+
 
 # ==================================================
-# FastAPI app
+# Load pipeline & model only once
 # ==================================================
-app = FastAPI()
-
-# Globals to hold Spark + models
-spark = None
-pipeline_model = None
-gbt_model = None
-
-@app.on_event("startup")
-def load_models():
-    global spark, pipeline_model, gbt_model
-    if spark is None:
-        print("🔄 Initializing Spark session...")
-        spark = SparkSession.builder.appName("CreditCardFraudAPI").getOrCreate()
-
-    if pipeline_model is None:
-        print("🔄 Loading preprocessing pipeline...")
-        pipeline_model = PipelineModel.load("models/preprocessing_pipeline")
-
-    if gbt_model is None:
-        print("🔄 Loading GBT model...")
-        gbt_model = GBTClassificationModel.load("models/gbt_fraud_model")
-
-@app.on_event("shutdown")
-def stop_spark():
-    global spark
-    if spark:
-        print("🛑 Stopping Spark session...")
-        spark.stop()
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PIPELINE_PATH = os.path.join(BASE_DIR, "models", "preprocessing_pipeline")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "gbt_fraud_model")
 
 # ==================================================
 # Middleware for latency logging
@@ -225,33 +227,14 @@ async def add_process_time_header(request: Request, call_next):
 def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-import time
-import logging
-import traceback
-import pandas as pd
-from fastapi import UploadFile, File
-from pyspark.sql.functions import col as spark_col, udf
-from pyspark.sql.types import DoubleType
-
 # ==================================================
-# UDF to extract fraud probability from vector
-# ==================================================
-def extract_prob(v):
-    try:
-        return float(v[1])  # index 1 = fraud class
-    except Exception:
-        return None
-
-extract_prob_udf = udf(extract_prob, DoubleType())
-
-# ==================================================
-# Endpoint: Predict single transaction
+# Endpoints
 # ==================================================
 @app.post("/predict_single")
 def predict_single(request: TransactionRequest):
     start_time = time.time()
     try:
-        data = request.dict()
+        data = request.model_dump()   # ✅ Pydantic v2 fix
         df = pd.DataFrame([data])
         sdf = spark.createDataFrame(df)
 
@@ -261,7 +244,6 @@ def predict_single(request: TransactionRequest):
         preds = preds.withColumn("fraud_probability", extract_prob_udf(spark_col("probability")))
         result = preds.select("TransactionID", "fraud_probability", "prediction").toPandas()
 
-        # Add fraud flag
         result["fraud"] = result["prediction"].apply(lambda x: bool(int(x)))
         result.drop(columns=["prediction"], inplace=True)
 
@@ -279,21 +261,16 @@ def predict_single(request: TransactionRequest):
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
-# ==================================================
-# Endpoint: Predict batch from file
-# ==================================================
 @app.post("/predict_batch")
 async def predict_batch(file: UploadFile = File(...)):
     start_time = time.time()
     try:
         df = pd.read_csv(file.file)
 
-        # Ensure all expected features exist
         for col in EXPECTED_FEATURES:
             if col not in df.columns:
                 df[col] = 0 if not col.endswith(("CD", "Type", "Info", "domain")) else "missing"
 
-        # Reorder
         df = df[EXPECTED_FEATURES]
         sdf = spark.createDataFrame(df)
 
