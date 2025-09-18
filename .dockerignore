@@ -1,0 +1,9 @@
+# Ignore data and heavy files
+data/
+notebooks/
+logs/
+*.parquet
+*.csv
+*.ipynb
+__pycache__/
+*.pyc

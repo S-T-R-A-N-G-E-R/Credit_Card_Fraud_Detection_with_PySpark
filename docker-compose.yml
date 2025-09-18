@@ -1,0 +1,52 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: cc_fraud_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models   # Mount models at runtime
+      - ./data:/app/data       # Mount data at runtime
+      - ./logs:/app/logs       # Optional: logs outside container
+    networks:
+      - cc_fraud_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cc_fraud_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    depends_on:
+      - api
+    networks:
+      - cc_fraud_net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cc_fraud_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - cc_fraud_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cc_fraud_grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - cc_fraud_net
+
+networks:
+  cc_fraud_net:
+    driver: bridge
